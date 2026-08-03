@@ -18,6 +18,14 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+# O console do Windows usa cp1252 e quebra ao imprimir emoji da legenda.
+# A legenda em si vai para a API em UTF-8 -- isto afeta so o que aparece na tela.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
 # ---------------------------------------------------------------- credenciais
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -78,29 +86,125 @@ def expand(patterns: list) -> list:
 
 # ------------------------------------------------------------------ hospedagem
 
-def host_image(image_path: str) -> str:
-    """
-    Hospeda a imagem numa URL publica via catbox.moe.
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) publish_instagram/1.0"
 
-    A API do Instagram nao aceita upload de arquivo local: ela exige uma URL
-    publica que os servidores da Meta consigam baixar. O catbox.moe e um host
-    publico e gratuito -- a imagem fica acessivel por link a quem tiver a URL.
+
+def _up_0x0(path: Path):
+    with open(path, "rb") as fh:
+        r = requests.post("https://0x0.st", files={"file": (path.name, fh)},
+                          headers={"User-Agent": UA}, timeout=120)
+    u = r.text.strip()
+    return u if u.startswith("https://") else None
+
+
+def _up_tmpfiles(path: Path):
+    with open(path, "rb") as fh:
+        r = requests.post("https://tmpfiles.org/api/v1/upload",
+                          files={"file": (path.name, fh)},
+                          headers={"User-Agent": UA}, timeout=120)
+    u = (r.json().get("data") or {}).get("url", "")
+    # a API devolve a pagina de visualizacao; o download direto leva /dl/
+    return u.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1) if u.startswith("http") else None
+
+
+def _up_catbox(path: Path):
+    with open(path, "rb") as fh:
+        r = requests.post("https://catbox.moe/user/api.php",
+                          data={"reqtype": "fileupload"},
+                          files={"fileToUpload": (path.name, fh)},
+                          headers={"User-Agent": UA}, timeout=120)
+    u = r.text.strip()
+    return u if u.startswith("https://") else None
+
+
+REPO = Path(__file__).resolve().parent.parent
+RAW = "https://raw.githubusercontent.com/Nicevargas/instagram/main/publicadas"
+
+
+def _up_github(path: Path):
     """
-    with open(image_path, "rb") as fh:
-        resp = requests.post(
-            "https://catbox.moe/user/api.php",
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": (Path(image_path).name, fh)},
-            timeout=120,
-        )
-    url = resp.text.strip()
-    if not url.startswith("https://"):
-        die(f"Falha ao hospedar {image_path}: {url}")
-    print(f"  Hospedada: {Path(image_path).name} -> {url}")
+    Host principal: o proprio repositorio da usuaria.
+
+    A Meta precisa de uma URL publica que ela consiga baixar. Servir do
+    raw.githubusercontent.com evita depender de host de terceiro -- que foi
+    exatamente o que quebrou (catbox bloqueado na rede, 0x0.st desativado).
+    """
+    import shutil
+    import subprocess
+
+    destino = REPO / "publicadas"
+    destino.mkdir(exist_ok=True)
+    alvo = destino / path.name
+    if not alvo.exists() or alvo.read_bytes() != path.read_bytes():
+        shutil.copyfile(path, alvo)
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True)
+
+    git("add", "publicadas")
+    if git("diff", "--cached", "--quiet").returncode != 0:      # ha algo novo
+        git("commit", "-m", "Add slides for Instagram publishing")
+        if git("push", "origin", "main").returncode != 0:
+            return None
+
+    url = f"{RAW}/{path.name}"
+    try:
+        if requests.head(url, timeout=30, allow_redirects=True).status_code != 200:
+            return None
+    except Exception:
+        return None
     return url
 
 
+HOSTS = [("github raw", _up_github), ("0x0.st", _up_0x0),
+         ("tmpfiles.org", _up_tmpfiles), ("catbox.moe", _up_catbox)]
+
+
+def host_image(image_path: str) -> str:
+    """
+    Hospeda a imagem numa URL publica.
+
+    A API do Instagram nao aceita upload de arquivo local: ela exige uma URL
+    publica que os servidores da Meta consigam baixar. Tenta os hosts em ordem
+    -- redes diferentes bloqueiam hosts diferentes, entao vale ter alternativa.
+    A imagem fica acessivel por link a quem tiver a URL.
+    """
+    path = Path(image_path)
+    erros = []
+    for nome, fn in HOSTS:
+        try:
+            url = fn(path)
+            if url:
+                print(f"  {path.name} -> {url}  [{nome}]")
+                return url
+            erros.append(f"{nome}: resposta invalida")
+        except Exception as e:
+            erros.append(f"{nome}: {type(e).__name__}")
+    die("Nenhum host aceitou o upload de " + path.name + "\n  " + "\n  ".join(erros))
+
+
 # -------------------------------------------------------------------- API calls
+
+def _post_retry(url: str, payload: dict, what: str, tries: int = 5) -> dict:
+    """
+    A Meta devolve erros marcados 'is_transient' com alguma frequencia.
+    Nesses casos a orientacao dela e repetir -- entao repetimos com espera
+    crescente em vez de abortar a publicacao inteira.
+    """
+    espera = 4
+    for tentativa in range(1, tries + 1):
+        result = requests.post(url, data=payload, timeout=120).json()
+        if "id" in result:
+            return result
+        err = result.get("error", {})
+        if not err.get("is_transient") or tentativa == tries:
+            die(f"Falha ao {what}: {result}")
+        print(f"    erro temporario da Meta, tentativa {tentativa}/{tries} "
+              f"- aguardando {espera}s")
+        time.sleep(espera)
+        espera *= 2
+    return {}
+
 
 def create_container(image_url: str, caption: str = None, carousel_item: bool = False) -> str:
     payload = {"access_token": TOKEN, "image_url": image_url}
@@ -109,28 +213,18 @@ def create_container(image_url: str, caption: str = None, carousel_item: bool = 
     if caption is not None:
         payload["caption"] = caption
 
-    resp = requests.post(f"{BASE_URL}/{ACCOUNT}/media", data=payload, timeout=120)
-    result = resp.json()
-    if "id" not in result:
-        die(f"Falha ao criar container: {result}")
+    result = _post_retry(f"{BASE_URL}/{ACCOUNT}/media", payload, "criar container")
     print(f"  Container: {result['id']}")
     return result["id"]
 
 
 def create_carousel(children: list, caption: str) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/{ACCOUNT}/media",
-        data={
-            "access_token": TOKEN,
-            "media_type": "CAROUSEL",
-            "children": ",".join(children),
-            "caption": caption,
-        },
-        timeout=60,
-    )
-    result = resp.json()
-    if "id" not in result:
-        die(f"Falha ao montar carrossel: {result}")
+    result = _post_retry(f"{BASE_URL}/{ACCOUNT}/media", {
+        "access_token": TOKEN,
+        "media_type": "CAROUSEL",
+        "children": ",".join(children),
+        "caption": caption,
+    }, "montar carrossel")
     print(f"  Carrossel: {result['id']}")
     return result["id"]
 
@@ -154,14 +248,9 @@ def wait_ready(container_id: str, tries: int = 20, delay: int = 5) -> None:
 
 
 def publish(container_id: str) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/{ACCOUNT}/media_publish",
-        data={"access_token": TOKEN, "creation_id": container_id},
-        timeout=60,
-    )
-    result = resp.json()
-    if "id" not in result:
-        die(f"Falha ao publicar: {result}")
+    result = _post_retry(f"{BASE_URL}/{ACCOUNT}/media_publish",
+                         {"access_token": TOKEN, "creation_id": container_id},
+                         "publicar")
     return result["id"]
 
 
