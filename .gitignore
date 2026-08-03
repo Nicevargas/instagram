@@ -1,0 +1,9 @@
+# Nunca versionar credenciais
+.env
+.env.*
+*.token
+
+# Saidas locais
+slides/
+out/
+__pycache__/
