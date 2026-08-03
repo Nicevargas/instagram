@@ -7,3 +7,10 @@
 slides/
 out/
 __pycache__/
+
+# Fotos pessoais ficam fora do repositorio publico.
+# A origem delas esta documentada em COMO-PUBLICAR.md (IDs do Drive),
+# entao da para recuperar sem versionar aqui. A logo fica, e publica.
+assets/*.jpg
+assets/*.jpeg
+!assets/icone_xicara.png
